@@ -1,9 +1,9 @@
 import pandas as pd
 import random
 
-# Chemins des fichiers (à adapter)
-input_file_path = "Data/export-tombola-de-l-institut-de-myologie-2024-la-myocoop-25_11_2024-14_01_2025.xlsx"
-output_file_path = "ProcessData/expanded_tombola_data.xlsx"
+# Chemins des fichiers
+input_file_path = r"C:\Users\m.jacoupy\OneDrive - Institut\Documents\3 - Developpements informatiques\Tombola\Data\25.xlsx"
+output_file_path = r"C:\Users\m.jacoupy\OneDrive - Institut\Documents\3 - Developpements informatiques\Tombola\ProcessData\expanded_tombola_data.xlsx"
 
 # Charger les données depuis le fichier Excel
 excel_data = pd.ExcelFile(input_file_path)
