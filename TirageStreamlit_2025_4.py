@@ -2,6 +2,13 @@
 """
 Application de tirage au sort - Tombola
 Gestion des lots et des tickets avec interface graphique Streamlit.
+
+Version demandée :
+- Identification des personnes POUR LES LOTS RESTREINTS basée sur "Prénom + Nom" (pas l'email)
+- Lots restreints : tirage ALÉATOIRE PAR TICKET (proportionnel aux tickets)
+  + une même personne (Prénom+Nom) ne peut gagner qu'une fois ce lot restreint
+- Numéro de lot : 1 numéro par exemplaire (groupe de lots) + extraction robuste
+- Optimisations perf : colonnes d'identifiants pré-calculées une fois (vectorisées)
 """
 
 import streamlit as st
@@ -26,16 +33,64 @@ def load_data():
     lots_df = pd.read_excel(lots_file_path)
     return tickets_df, lots_df
 
+
+def norm_text(x) -> str:
+    """Normalise une chaîne pour comparaison (espaces + casse)."""
+    return str(x).strip().casefold()
+
+
+def add_person_key_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ajoute une colonne _person_key basée STRICTEMENT sur prénom+nom (normalisés),
+    utilisée pour les exclusions sur lots restreints.
+    """
+    out = df.copy()
+    for col in ["Prénom", "Nom"]:
+        if col not in out.columns:
+            out[col] = ""
+
+    prenom = out["Prénom"].astype(str).str.strip().str.casefold()
+    nom = out["Nom"].astype(str).str.strip().str.casefold()
+
+    out["_person_key"] = "name:" + prenom + "|" + nom
+    return out
+
+
+def get_lot_number(lot_row, fallback_index=None):
+    """
+    Récupère le numéro de lot de façon robuste, quel que soit le nom de colonne dans Lots25.xlsx.
+    """
+    candidates = [
+        "numéro", "numero",
+        "Numéro", "Numero",
+        "numéro du lot", "numero du lot",
+        "Numéro du lot", "Numero du lot",
+        "N° lot", "N°", "N°Lot", "N° Lot",
+        "Numero lot", "numéro lot", "numero lot",
+    ]
+    for c in candidates:
+        if c in lot_row and pd.notna(lot_row[c]):
+            return lot_row[c]
+    return (fallback_index + 1) if fallback_index is not None else None
+
+
 def load_existing_results():
-    """Charge les résultats enregistrés s'ils existent."""
+    """Charge les résultats enregistrés s'ils existent. Migre l'ancienne clé 'numéro' si besoin."""
     try:
-        return pd.read_excel(output_file_path).to_dict('records')
+        df = pd.read_excel(output_file_path)
+
+        if "numéro" in df.columns and "Numéro du lot" not in df.columns:
+            df["Numéro du lot"] = df["numéro"]
+
+        return df.to_dict("records")
     except FileNotFoundError:
         return []
+
 
 def save_results(results):
     """Enregistre les résultats dans un fichier Excel."""
     pd.DataFrame(results).to_excel(output_file_path, index=False)
+
 
 def export_results(results):
     """Crée un fichier d'export avec Prénom, initiale du nom de famille, ticket, offert par, email, et numéro du lot."""
@@ -44,15 +99,16 @@ def export_results(results):
         formatted_result = {
             "Numéro du lot": result.get("Numéro du lot", ""),
             "Prénom": result["Prénom"],
-            "Nom": result["Nom"][0].upper() + ".",  # Initiale du nom de famille
+            "Nom": result["Nom"][0].upper() + ".",
             "Numéro du billet original": result["Numéro du billet original"],
             "Lot": result["Lot"],
             "Offert par": result["Offert par"],
-            "Adresse e-mail": result["Adresse e-mail"],
+            "Adresse e-mail": result.get("Adresse e-mail", ""),
         }
         export_data.append(formatted_result)
 
     pd.DataFrame(export_data).to_excel(export_file_path, index=False)
+
 
 def reset_results():
     """Réinitialise l'historique des tirages."""
@@ -60,15 +116,20 @@ def reset_results():
         os.remove(output_file_path)
     if os.path.exists(export_file_path):
         os.remove(export_file_path)
+
     st.session_state.current_lot_index = 0
     st.session_state.results = []
-    st.session_state.tickets_df = load_data()[0]
+    st.session_state.tickets_df = add_person_key_column(load_data()[0])
     st.session_state.restricted_winners_per_lot = {}
+
     st.success("Historique réinitialisé avec succès.")
+    st.rerun()
+
 
 def format_name(name):
     """Formate les prénoms composés avec des majuscules appropriées."""
     return "-".join([part.capitalize() for part in str(name).split("-")])
+
 
 def format_last_name(last_name):
     """Formate les noms de famille pour gérer les majuscules après espaces ou tirets."""
@@ -79,28 +140,8 @@ def format_last_name(last_name):
     )
     return formatted_name
 
-# === Normalisation & identifiants ===
 
-def norm_text(x) -> str:
-    """Normalise une chaîne pour comparaison (espaces + casse)."""
-    return str(x).strip().casefold()
-
-def person_id(row) -> str:
-    """
-    Identifiant unique de personne pour la restriction.
-    Priorité : email (normalisé).
-    Fallback : prénom+nom normalisés.
-    """
-    email = row.get("Adresse e-mail", "")
-    email_norm = norm_text(email)
-    if email_norm and email_norm != "nan":
-        return f"email:{email_norm}"
-    # fallback si pas d'email fiable
-    prenom = norm_text(row.get("Prénom", ""))
-    nom = norm_text(row.get("Nom", ""))
-    return f"name:{prenom}|{nom}"
-
-# === Gestion des lots restreints ===
+# === Lots restreints ===
 
 restricted_lots = [
     "Pot de miel + abonnement Kazidomi", "Patchs anti-cernes", "Patchs anti-cernes + gel douche + beurre de karité", "Crème pour les mains",
@@ -112,12 +153,11 @@ restricted_lots = [
     "Peluche fruits et légumes", "2 entrées enfant", "2 Kits éducatif + pochette", "Gel douche"
 ]
 
-# Ensemble normalisé pour comparer sans bugs (casse/espaces)
 restricted_lots_norm = {norm_text(x) for x in restricted_lots}
 
 if "restricted_winners_per_lot" not in st.session_state:
-    # dict : lot_norm -> set(person_id)
     st.session_state.restricted_winners_per_lot = {}
+
 
 def draw_lots_group(tickets_df, lots_df, current_lot_index):
     """Effectue un tirage au sort pour un groupe de lots similaires."""
@@ -125,13 +165,13 @@ def draw_lots_group(tickets_df, lots_df, current_lot_index):
         st.warning("Tous les lots ont déjà été tirés !")
         return None, tickets_df, current_lot_index
 
-    lot = lots_df.iloc[current_lot_index]
+    lot0 = lots_df.iloc[current_lot_index]
     group_count = 1
 
     while (
         current_lot_index + group_count < len(lots_df)
-        and lots_df.iloc[current_lot_index + group_count]["lot"] == lot["lot"]
-        and lots_df.iloc[current_lot_index + group_count]["offert par"] == lot["offert par"]
+        and lots_df.iloc[current_lot_index + group_count]["lot"] == lot0["lot"]
+        and lots_df.iloc[current_lot_index + group_count]["offert par"] == lot0["offert par"]
     ):
         group_count += 1
 
@@ -139,76 +179,65 @@ def draw_lots_group(tickets_df, lots_df, current_lot_index):
         st.warning("Plus aucun ticket disponible !")
         return None, tickets_df, current_lot_index
 
-    lot_name = lot["lot"]
+    lot_name = lot0["lot"]
     lot_name_norm = norm_text(lot_name)
 
+    # Groupe des lots (un numéro par ligne / exemplaire)
+    lot_group = lots_df.iloc[current_lot_index: current_lot_index + group_count].reset_index(drop=True)
+    lot_numbers = [
+        get_lot_number(lot_group.iloc[i], fallback_index=current_lot_index + i)
+        for i in range(group_count)
+    ]
+
     # === Cas LOT RESTREINT ===
+    # Tirage PAR TICKET + exclusion par (prénom+nom)
     if lot_name_norm in restricted_lots_norm:
         if lot_name_norm not in st.session_state.restricted_winners_per_lot:
             st.session_state.restricted_winners_per_lot[lot_name_norm] = set()
 
+        # ⚠️ Ici on garde le set global, mais on va le "vider" si tout le monde est exclu
         excluded_people = st.session_state.restricted_winners_per_lot[lot_name_norm]
-
-        # Tickets éligibles = tickets dont la personne n'a PAS déjà gagné ce lot
-        # On calcule aussi l'id de personne sur chaque ligne
-        tmp = tickets_df.copy()
-        tmp["_pid"] = tmp.apply(person_id, axis=1)
-
-        eligible_tickets = tmp[~tmp["_pid"].isin(excluded_people)].copy()
-
-        # Nombre de personnes éligibles (pas tickets)
-        eligible_people_count = eligible_tickets["_pid"].nunique()
-
-        if eligible_people_count == 0:
-            st.warning(f"Aucun participant éligible pour le lot restreint : {lot_name}.")
-            return None, tickets_df, current_lot_index + group_count  # on passe ce groupe
-
-        if eligible_people_count < group_count:
-            st.warning(
-                f"Seulement {eligible_people_count} participants éligibles pour {group_count} exemplaires du lot '{lot_name}'. "
-                "Certains exemplaires resteront non attribués."
-            )
-            group_count = eligible_people_count
-
         results = []
 
-        # Pour garantir 1 personne max dans le groupe :
-        # on tire une personne (pid) au hasard, puis un ticket appartenant à cette personne.
-        for _ in range(group_count):
-            # Recalculer les éligibles à chaque itération
-            tmp = tickets_df.copy()
-            tmp["_pid"] = tmp.apply(person_id, axis=1)
-            eligible_tickets = tmp[~tmp["_pid"].isin(excluded_people)].copy()
+        for i in range(group_count):
 
-            if eligible_tickets.empty:
-                st.warning(f"Aucun ticket éligible pour les exemplaires restants du lot '{lot_name}'.")
-                break
+            # Tickets éligibles = ceux dont la personne n'a pas déjà gagné DANS CE TOUR
+            eligible = tickets_df[~tickets_df["_person_key"].isin(excluded_people)]
 
-            # Tirer une personne parmi les pids éligibles
-            pid_choices = eligible_tickets["_pid"].drop_duplicates()
-            chosen_pid = pid_choices.sample(1).iloc[0]
+            # ✅ Si plus personne d'éligible, on relance un tour (on ré-autorise tout le monde)
+            if eligible.empty:
+                excluded_people.clear()
+                eligible = tickets_df  # tout le monde redevient éligible
 
-            # Tirer un ticket de cette personne
-            winner = eligible_tickets[eligible_tickets["_pid"] == chosen_pid].sample(1).iloc[0]
+                # si même là c'est vide -> plus aucun ticket global, donc stop
+                if eligible.empty:
+                    st.warning(f"Aucun ticket disponible pour attribuer les exemplaires restants du lot '{lot_name}'.")
+                    break
+
+            # ✅ Tirage aléatoire PAR TICKET
+            winner = eligible.sample(1).iloc[0]
+            pkey = winner["_person_key"]
 
             results.append({
+                "Numéro du lot": lot_numbers[i],
                 "Prénom": format_name(winner["Prénom"]),
                 "Nom": format_last_name(winner["Nom"]),
                 "Lot": lot_name,
-                "Offert par": lot["offert par"],
-                "Adresse e-mail": winner["Adresse e-mail"],
+                "Offert par": lot0["offert par"],
+                "Adresse e-mail": winner.get("Adresse e-mail", ""),
                 "Numéro du billet original": winner["Numéro du billet original"],
             })
 
-            # Marquer la personne comme gagnante de CE lot restreint
-            excluded_people.add(chosen_pid)
+            # Bloquer la personne pour le reste du tour
+            excluded_people.add(pkey)
 
             # Retirer le ticket tiré du pool global (comme avant)
             tickets_df = tickets_df.drop(winner.name)
 
         return results, tickets_df, current_lot_index + group_count
 
-    # === Cas LOT NON RESTREINT (tirage normal) ===
+
+    # === Cas LOT NON RESTREINT (tirage normal par ticket) ===
     if len(tickets_df) < group_count:
         st.warning("Pas assez de tickets pour tirer tous les gagnants !")
         return None, tickets_df, current_lot_index
@@ -217,18 +246,19 @@ def draw_lots_group(tickets_df, lots_df, current_lot_index):
     tickets_df = tickets_df.drop(winners.index)
 
     results = []
-    for _, winner in winners.iterrows():
+    for i, (_, winner) in enumerate(winners.iterrows()):
         results.append({
-            "Numéro du lot": lot.get("numéro du lot", lot.get("Numero lot", lot.get("N° lot", current_lot_index + 1))),
+            "Numéro du lot": lot_numbers[i],
             "Prénom": format_name(winner["Prénom"]),
             "Nom": format_last_name(winner["Nom"]),
             "Lot": lot_name,
-            "Offert par": lot["offert par"],
-            "Adresse e-mail": winner["Adresse e-mail"],
+            "Offert par": lot0["offert par"],
+            "Adresse e-mail": winner.get("Adresse e-mail", ""),
             "Numéro du billet original": winner["Numéro du billet original"],
         })
 
     return results, tickets_df, current_lot_index + group_count
+
 
 # === Configuration de la barre latérale ===
 st.sidebar.image(logo_afm_path, use_column_width=True)
@@ -244,8 +274,8 @@ st.markdown(
         margin: 20px 0;
     }
     div.stButton > button {
-        background-color: #00B2B2; /* PANTONE 7466C */
-        color: white !important; /* Couleur blanche pour le texte */
+        background-color: #00B2B2;
+        color: white !important;
         font-size: 16px;
         font-weight: bold;
         padding: 10px 20px;
@@ -255,8 +285,8 @@ st.markdown(
         transition: background-color 0.3s ease, color 0.3s ease;
     }
     div.stButton > button:hover {
-        background-color: #008080; /* Couleur légèrement plus foncée pour l'effet hover */
-        color: white !important; /* Maintenir le texte blanc au survol */
+        background-color: #008080;
+        color: white !important;
     }
     div.stButton > button:focus {
         outline: none;
@@ -272,6 +302,7 @@ with col2:
     st.title("Tirage au Sort - Tombola")
 
 tickets_df, lots_df = load_data()
+tickets_df = add_person_key_column(tickets_df)
 
 if "current_lot_index" not in st.session_state:
     st.session_state.current_lot_index = 0
@@ -292,13 +323,16 @@ with col2:
         if draw_results:
             results = draw_results
             st.session_state.results.extend(draw_results)
+
+            # Écritures (peuvent être lentes avec OneDrive + Excel)
             save_results(st.session_state.results)
             export_results(st.session_state.results)
+
             st.session_state.current_lot_index = new_index
 
 col1, col2, col3, col4, col5 = st.columns([1, 3, 1, 3, 1])
 
-with col4:
+with col2:
     with st.container():
         st.markdown("### 🎉 Gagnants")
         if results:
@@ -311,7 +345,7 @@ with col4:
         else:
             st.info("Aucun gagnant pour le moment.")
 
-with col2:
+with col4:
     with st.container():
         st.markdown("### 🎁 Prochain(s) lot(s)")
         if st.session_state.current_lot_index < len(lots_df):
@@ -331,7 +365,7 @@ with col2:
 
 st.markdown("---")
 st.subheader("Historique des tirages")
-if len(st.session_state.results) > 1:
+if len(st.session_state.results) > 0:
     results_no_email = [
         {k: v for k, v in result.items() if k != "Adresse e-mail"}
         for result in st.session_state.results
